@@ -21,9 +21,16 @@ Run: uv run --script server.py   (stdio transport)
 
 from __future__ import annotations
 
+import os
+
+# Cap BLAS/OpenMP thread pools before numpy is imported. OpenBLAS starts one thread per host
+# core (about 64 here), and every Claude Code session runs its own copy of this server, so the
+# default exhausts the container's pids limit. Embedding math on small arrays needs no threads.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import fnmatch
 import logging
-import os
 import re
 import sqlite3
 import subprocess
