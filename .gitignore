@@ -1,2 +1,3 @@
 .ruff_cache/
 ._*
+__pycache__/

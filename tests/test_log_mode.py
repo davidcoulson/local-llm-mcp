@@ -26,7 +26,7 @@ def syslog_fixture() -> str:
         minute = 10 + i % 50
         lines.append(
             f"Oct 10 11:{minute:02d}:{i % 60:02d} tower sshd-session[{4000 + i}]: "
-            f"Accepted publickey for root from 10.2.6.{20 + i % 3} port {50000 + i} ssh2"
+            f"Accepted publickey for root from 192.0.2.{20 + i % 3} port {50000 + i} ssh2"
         )
     # UPS glitch, three times in ten minutes.
     for t, ago in (
@@ -40,7 +40,7 @@ def syslog_fixture() -> str:
         )
     # Hourly mover run with two folder-not-dataset warnings and routine lines.
     for hour in range(12, 22):
-        for share, size in (("isos", 214 + hour), ("michelle", 3 + hour)):
+        for share, size in (("isos", 214 + hour), ("media", 3 + hour)):
             lines += [
                 f"Oct 10 {hour}:00:03 tower move: Share Information: Name: {share} - Path: /mnt/exos24tb/{share}",
                 f"Oct 10 {hour}:00:03 tower move: cannot open 'exos24tb/{share}': dataset does not exist",
@@ -129,7 +129,7 @@ def test_looks_like_log():
     ("a", "b"),
     [
         (
-            "Accepted publickey for root from 10.2.6.20 port 51234 ssh2",
+            "Accepted publickey for root from 192.0.2.20 port 51234 ssh2",
             "Accepted publickey for root from 192.168.1.9 port 2201 ssh2",
         ),
         ("exos24tb/isos used: 214GiB", "exos24tb/isos used: 3.8TiB"),
@@ -165,7 +165,7 @@ def test_repeats_share_a_template(a, b):
         # Names that contain digits are identifiers, not counters.
         (
             "cannot open 'exos24tb/isos': dataset does not exist",
-            "cannot open 'exos24tb/michelle': dataset does not exist",
+            "cannot open 'exos24tb/media': dataset does not exist",
         ),
         ("spinning down /dev/sdah", "spinning down /dev/sdm"),
         (
@@ -221,7 +221,7 @@ def test_classify_flags(program, message, flag):
         ("move", "Primary storage: nvme8tb (zfs) - size: 14TiB - used: 26 %"),
         ("move", "Notify: errorsOnly"),
         ("emhttpd", "read SMART /dev/sdah"),
-        ("sshd-session", "Accepted publickey for root from 10.2.6.20 port 51234 ssh2"),
+        ("sshd-session", "Accepted publickey for root from 192.0.2.20 port 51234 ssh2"),
         ("move", "Secondary storage: none"),
     ],
 )
@@ -365,7 +365,7 @@ def test_log_file_goes_to_the_model_as_one_digest(tmp_path, fake_chat):
     assert len(fake_chat) == 1
     sent = fake_chat[0]["user"]
     assert sent.startswith("Focus: hardware\n\nLOG DIGEST of syslog.txt")
-    assert "10.2.6.20" not in sent  # noise is counted, not sent
+    assert "192.0.2.20" not in sent  # noise is counted, not sent
     assert len(sent) < 8_000
     assert out.startswith("summary 1\n\nFlagged messages, exact")
     assert "1x 12:43:05 [fail] smbd" in out

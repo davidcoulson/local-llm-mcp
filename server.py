@@ -5,13 +5,13 @@
 """
 local-llm: an MCP server that lets Claude Code hand bulk or private work to local models.
 
-The models run in Ollama on the Unraid server's RTX 3070 (http://10.2.6.50:11434 by default):
+The models run in Ollama on a machine you control (http://localhost:11434 by default):
 a small chat model (qwen3:8b) for summaries and questions, and an embedding model
 (qwen3-embedding:0.6b) for semantic search. File contents go to that server only, never to a
 cloud service, and the work does not use Claude's context or allowance.
 
 Configuration (environment):
-  OLLAMA_URL        Ollama base URL (default http://10.2.6.50:11434)
+  OLLAMA_URL        Ollama base URL (default http://localhost:11434)
   LOCAL_CHAT_MODEL  chat model (default qwen3:8b)
   LOCAL_EMBED_MODEL embedding model (default qwen3-embedding:0.6b)
   LOCAL_LLM_CACHE   cache directory for the search index (default ~/.cache/local-llm-mcp)
@@ -36,7 +36,7 @@ import httpx
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://10.2.6.50:11434").rstrip("/")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 CHAT_MODEL = os.environ.get("LOCAL_CHAT_MODEL", "qwen3:8b")
 EMBED_MODEL = os.environ.get("LOCAL_EMBED_MODEL", "qwen3-embedding:0.6b")
 CACHE_DIR = Path(
