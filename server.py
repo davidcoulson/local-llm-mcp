@@ -639,7 +639,7 @@ def build_digest(text: str, focus: str = "", name: str = "log") -> Digest:
         flagged,
         key=lambda t: (t.count > FEW_MAX, min(severity[f] for f in t.flags), -t.count),
     )
-    chosen, dropped = take(prio, DIGEST_FLAGGED_CHARS, by_time)
+    chosen, flagged_dropped = take(prio, DIGEST_FLAGGED_CHARS, by_time)
     once = [t for t in chosen if t.count <= FEW_MAX]
     repeated = [t for t in chosen if t.count > FEW_MAX]
     sections.append(
@@ -647,8 +647,8 @@ def build_digest(text: str, focus: str = "", name: str = "log") -> Digest:
         + ("\n".join(entry_line(t) for t in once) or "(none)")
     )
     body = "\n".join(entry_line(t) for t in repeated) or "(none)"
-    if dropped:
-        body += f"\n({dropped} more flagged messages omitted for space)"
+    if flagged_dropped:
+        body += f"\n({flagged_dropped} more flagged messages omitted for space)"
     sections.append(
         f"== Repeating errors, warnings and hardware events ({len(repeated)}) ==\n{body}"
     )
@@ -747,8 +747,8 @@ def build_digest(text: str, focus: str = "", name: str = "log") -> Digest:
             break
         problems.append(line)
         used_chars += len(line) + 1
-    if dropped:
-        problems.append(f"({dropped} more flagged messages not listed)")
+    if flagged_dropped:
+        problems.append(f"({flagged_dropped} more flagged messages not listed)")
     return Digest("\n\n".join(sections), nlines, len(templates), "\n".join(problems))
 
 
@@ -815,6 +815,27 @@ async def _summarize_text(p: Path, text: str, task: str) -> str:
                     max_tokens=400,
                 )
             )
+        # Merge notes in groups that fit one request until a single group is left.
+        while sum(len(n) for n in notes) > CHUNK_CHARS and len(notes) > 1:
+            groups, cur = [], []
+            for n in notes:
+                if cur and sum(map(len, cur)) + len(n) > CHUNK_CHARS:
+                    groups.append(cur)
+                    cur = []
+                cur.append(n)
+            groups.append(cur)
+            if len(groups) == len(notes):
+                break
+            notes = [
+                await _chat(
+                    client,
+                    system,
+                    f"Focus: {task}\nMerge these notes on consecutive parts of {p.name} "
+                    "into at most 15 bullet points, keeping counts.\n\n" + "\n\n".join(g),
+                    max_tokens=400,
+                )
+                for g in groups
+            ]
         joined = "\n\n".join(f"Part {i}:\n{n}" for i, n in enumerate(notes, 1))
         summary = await _chat(
             client,
@@ -906,7 +927,12 @@ def _files(root: Path, pattern: str) -> list[Path]:
         }:
             continue
         try:
-            if p.is_file() and 0 < p.stat().st_size <= SEARCH_MAX_BYTES:
+            # Skip symlinks that lead outside the (resolved) root.
+            if (
+                p.is_file()
+                and 0 < p.stat().st_size <= SEARCH_MAX_BYTES
+                and p.resolve().is_relative_to(root)
+            ):
                 keep.append(p)
         except OSError:
             continue
@@ -969,43 +995,61 @@ async def semantic_search(query: str, root: str, k: int = 8, glob: str = "") -> 
         raise ValueError(f"not a directory: {base}")
     files = _files(base, glob)
     db = _db()
+    try:
+        return await _search(db, query, base, files, k)
+    finally:
+        db.close()
+
+
+async def _search(
+    db: sqlite3.Connection, query: str, base: Path, files: list[Path], k: int
+) -> str:
     indexed = embedded = 0
+    readable = []
     async with httpx.AsyncClient() as client:
-        pending: list[tuple[str, str, int, int, str]] = []
         for f in files:
-            st = f.stat()
-            sig = f"{st.st_mtime_ns}:{st.st_size}"
             key = str(f)
-            row = db.execute(
-                "SELECT sig FROM chunks WHERE model=? AND path=? LIMIT 1",
-                (EMBED_MODEL, key),
-            ).fetchone()
-            if row and row[0] == sig:
-                indexed += 1
-                continue
-            db.execute(
-                "DELETE FROM chunks WHERE model=? AND path=?", (EMBED_MODEL, key)
-            )
-            text = f.read_text(errors="replace")
+            try:
+                st = f.stat()
+                sig = f"{st.st_mtime_ns}:{st.st_size}"
+                row = db.execute(
+                    "SELECT sig FROM chunks WHERE model=? AND path=? LIMIT 1",
+                    (EMBED_MODEL, key),
+                ).fetchone()
+                if row and row[0] == sig:
+                    indexed += 1
+                    readable.append(f)
+                    continue
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue  # unreadable or vanished: skip it, don't abort the search
+            readable.append(f)
             rel = f.relative_to(base)
-            for first, last, chunk in _line_chunks(text):
-                pending.append((key, sig, first, last, f"File: {rel}\n{chunk}"))
-        for i in range(0, len(pending), EMBED_BATCH):
-            batch = pending[i : i + EMBED_BATCH]
-            vecs = await _embed(client, [b[4] for b in batch])
+            chunks = [
+                (first, last, f"File: {rel}\n{chunk}")
+                for first, last, chunk in _line_chunks(text)
+            ]
+            # Embed first, then write and commit this file, so no transaction spans a request.
+            vecs = [
+                v
+                for i in range(0, len(chunks), EMBED_BATCH)
+                for v in await _embed(client, [c[2] for c in chunks[i : i + EMBED_BATCH]])
+            ]
+            db.execute("DELETE FROM chunks WHERE model=? AND path=?", (EMBED_MODEL, key))
             db.executemany(
                 "INSERT INTO chunks VALUES (?,?,?,?,?,?,?)",
                 [
-                    (EMBED_MODEL, b[0], b[1], b[2], b[3], b[4], v.tobytes())
-                    for b, v in zip(batch, vecs)
+                    (EMBED_MODEL, key, sig, c[0], c[1], c[2], v.tobytes())
+                    for c, v in zip(chunks, vecs)
                 ],
             )
-            embedded += len(batch)
-        db.commit()
+            db.commit()
+            embedded += len(chunks)
+        files = readable
+        if not files:
+            return f"No text files to search under {base}."
         qvec = (await _embed(client, [QUERY_INSTRUCTION + query]))[0]
     keys = [str(f) for f in files]
-    if not keys:
-        return f"No text files to search under {base}."
     rows = []
     for i in range(0, len(keys), 500):
         part = keys[i : i + 500]
@@ -1013,7 +1057,8 @@ async def semantic_search(query: str, root: str, k: int = 8, glob: str = "") -> 
             f"SELECT path, first, last, text, vec FROM chunks WHERE model=? AND path IN ({','.join('?' * len(part))})",
             (EMBED_MODEL, *part),
         ).fetchall()
-    db.close()
+    if not rows:
+        return f"No indexable text under {base}."
     mat = np.frombuffer(b"".join(r[4] for r in rows), dtype=np.float32).reshape(
         len(rows), -1
     )

@@ -447,3 +447,81 @@ def test_chat_raises_on_other_errors():
 
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(run())
+
+
+def test_text_mode_merges_notes_that_do_not_fit_one_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "CHUNK_CHARS", 1_000)
+    real_chunks = server._chunks
+    monkeypatch.setattr(server, "_chunks", lambda text: real_chunks(text, 1_000))
+    sent = []
+
+    async def chat(client, system, user, max_tokens=1024):
+        sent.append(user)
+        return "n" * 400
+
+    monkeypatch.setattr(server, "_chat", chat)
+    f = tmp_path / "data.txt"
+    f.write_text("\n".join(f"row {i}" for i in range(1_000)))
+    asyncio.run(server.local_summarize(str(f), mode="text"))
+    assert len(sent) > 8  # many parts, plus merge rounds, plus the final call
+    assert len(sent[-1]) < 1_000 + 300  # the final combine call stays inside the budget
+
+
+def test_flagged_omission_count_is_not_overwritten(monkeypatch):
+    log = "\n".join(
+        f"Oct 10 11:00:{i % 60:02d} tower prog{i}: one-off note number {i} {'x' * (i % 7)}"
+        for i in range(400)
+    )
+    d = server.build_digest(log, focus="", name="syslog")
+    assert "more flagged messages not listed" not in d.problems
+
+
+@pytest.fixture
+def fake_embed(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "CACHE_DIR", tmp_path / "cache")
+
+    async def embed(client, texts):
+        return server.np.ones((len(texts), 4), dtype=server.np.float32)
+
+    monkeypatch.setattr(server, "_embed", embed)
+    return None
+
+
+def test_search_skips_symlink_out_of_root_and_survives_odd_files(tmp_path, fake_embed):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("password hunter2")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "notes.txt").symlink_to(secret)
+    (root / "blank.txt").write_text("\n \n")  # no chunks
+    assert server._files(root.resolve(), "") == [root.resolve() / "blank.txt"]
+    out = asyncio.run(server.semantic_search("pw", str(root)))
+    assert "hunter2" not in out and "No indexable text" in out
+    (root / "ok.txt").write_text("hello world")
+    (root / "gone.txt").symlink_to(root / "missing.txt")  # vanished target
+    out = asyncio.run(server.semantic_search("hello", str(root)))
+    assert "ok.txt:1-1" in out
+
+
+def test_search_commits_per_file_and_closes_on_error(tmp_path, fake_embed, monkeypatch):
+    (tmp_path / "a.txt").write_text("alpha")
+    (tmp_path / "b.txt").write_text("beta")
+    n = 0
+
+    async def flaky(client, texts):
+        nonlocal n
+        n += 1
+        if n == 2:
+            raise RuntimeError("ollama down")
+        return server.np.ones((len(texts), 4), dtype=server.np.float32)
+
+    monkeypatch.setattr(server, "_embed", flaky)
+    conns = []
+    real_db = server._db
+    monkeypatch.setattr(server, "_db", lambda: conns.append(real_db()) or conns[-1])
+    with pytest.raises(RuntimeError):
+        asyncio.run(server.semantic_search("x", str(tmp_path)))
+    with pytest.raises(server.sqlite3.ProgrammingError):  # closed
+        conns[0].execute("SELECT 1")
+    rows = real_db().execute("SELECT count(*) FROM chunks").fetchone()[0]
+    assert rows == 1  # the first file was committed before the failure
